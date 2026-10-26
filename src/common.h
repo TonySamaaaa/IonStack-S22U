@@ -404,5 +404,6 @@ int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value);
 int install_pipe_physrw(int fd);
 
 int install_android_root(int fd);
+int ksu_request_late_load(void);
 
 #endif

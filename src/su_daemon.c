@@ -17,8 +17,17 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/xattr.h>
 
 #define SOCK_PATH "/data/local/tmp/temp_su.sock"
+
+#define KSU_LOADER_PATH "/data/local/tmp/ksud"
+#define KSU_STAGE_PATH "/data/local/tmp/.ksud-stage"
+#define KSU_ADB_DIR "/data/adb"
+#define KSU_LOGCAT_PATH "/system/bin/logcat"
+#define KSU_KMI "android12-5.10"
 
 static void set_root_env(void) {
   setenv("PATH",
@@ -144,10 +153,131 @@ static int pump_pair(int a, int b) {
   return 0;
 }
 
+static int ksu_stage_sync(const char *src, const char *dst) {
+  struct stat ss, ds;
+  if (stat(dst, &ds) == 0 && stat(src, &ss) == 0 && ds.st_size == ss.st_size) {
+    return 1;
+  }
+  int in = open(src, O_RDONLY | O_CLOEXEC);
+  if (in < 0) {
+    return -1;
+  }
+  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+  if (out < 0) {
+    close(in);
+    return -1;
+  }
+  fchmod(out, 0755);
+  char buf[8192];
+  int ok = 1;
+  for (;;) {
+    ssize_t n = read(in, buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      break;
+    }
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = write(out, buf + off, (size_t)(n - off));
+      if (w < 0 && errno == EINTR) {
+        continue;
+      }
+      if (w <= 0) {
+        ok = 0;
+        break;
+      }
+      off += w;
+    }
+    if (!ok) {
+      break;
+    }
+  }
+  close(in);
+  close(out);
+  if (!ok) {
+    unlink(dst);
+    return -1;
+  }
+  return 0;
+}
+
+static void set_adb_selinux_ctx(void) {
+  static const char ctx[] = "u:object_r:system_data_root_file:s0";
+  if (setxattr(KSU_ADB_DIR, "security.selinux", ctx, sizeof(ctx), 0) != 0) {
+    dprintf(STDERR_FILENO, "late-load: setxattr %s: %s\n", KSU_ADB_DIR, strerror(errno));
+  }
+}
+
+static void set_ksud_selinux_ctx(void) {
+  static const char ctx[] = "u:object_r:shell_exec:s0";
+  if (setxattr(KSU_LOADER_PATH, "security.selinux", ctx, sizeof(ctx), 0) != 0) {
+    dprintf(STDERR_FILENO, "late-load: setxattr %s: %s\n", KSU_LOADER_PATH, strerror(errno));
+  }
+}
+
+static void run_kernelsu_late_load(int conn) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    dup2(conn, STDOUT_FILENO);
+    dup2(conn, STDERR_FILENO);
+    close(conn);
+    set_root_env();
+
+    set_adb_selinux_ctx();
+    set_ksud_selinux_ctx();
+    if (ksu_stage_sync(KSU_LOADER_PATH, KSU_STAGE_PATH) < 0) {
+      dprintf(STDERR_FILENO, "late-load: stage refresh failed (%s -> %s): %s\n",
+              KSU_LOADER_PATH, KSU_STAGE_PATH, strerror(errno));
+    }
+
+    if (unshare(CLONE_NEWNS) != 0 ||
+        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+      dprintf(STDERR_FILENO, "late-load: private mount namespace: %s\n", strerror(errno));
+      _exit(10);
+    }
+    if (mount(KSU_LOADER_PATH, KSU_LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
+      dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
+      _exit(11);
+    }
+
+    char *argv[] = {"logcat", "late-load", "--kmi", KSU_KMI,
+                    "--package-name", "com.rifsxd.ksunext", NULL};
+    execv(KSU_LOGCAT_PATH, argv);
+    dprintf(STDERR_FILENO, "late-load: exec: %s\n", strerror(errno));
+    _exit(12);
+  }
+
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  close(conn);
+}
+
 static int client_main(int argc, char **argv) {
   int fd = connect_daemon();
   if (fd < 0) {
     return 127;
+  }
+
+  if (argc >= 2 && strcmp(argv[1], "-k") == 0) {
+    char mode = 'K';
+    xwrite(fd, &mode, 1);
+
+    char buf[4096];
+    for (;;) {
+      ssize_t n = read(fd, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        break;
+      }
+      xwrite(STDOUT_FILENO, buf, (size_t)n);
+    }
+    close(fd);
+    return 0;
   }
 
   if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
@@ -274,6 +404,8 @@ static void serve_one(int conn) {
     free(cmd);
   } else if (mode == 'I') {
     exec_interactive_client(conn);
+  } else if (mode == 'K') {
+    run_kernelsu_late_load(conn);
   }
 }
 

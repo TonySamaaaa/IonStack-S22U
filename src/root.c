@@ -292,3 +292,45 @@ int install_android_root(int fd) {
   pr_info("root direct start uid=%u fd=%d\n", root_uid_before, fd);
   return install_workqueue_umh_root(fd);
 }
+
+int ksu_request_late_load(void) {
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    pr_error("ksu late-load: socket failed errno=%d\n", errno);
+    return -1;
+  }
+
+  struct sockaddr_un sun;
+  memset(&sun, 0, sizeof(sun));
+  sun.sun_family = AF_UNIX;
+  snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", ROOT_SOCKET_PATH);
+
+  if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) != 0) {
+    pr_error("ksu late-load: connect failed errno=%d\n", errno);
+    close(fd);
+    return -1;
+  }
+
+  char mode = 'K';
+  if (write(fd, &mode, 1) != 1) {
+    pr_error("ksu late-load: write 'K' failed errno=%d\n", errno);
+    close(fd);
+    return -1;
+  }
+
+  char buf[4096];
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      break;
+    }
+    if (write(STDOUT_FILENO, buf, (size_t)n) != (ssize_t)n) {
+      break;
+    }
+  }
+  close(fd);
+  return 0;
+}
